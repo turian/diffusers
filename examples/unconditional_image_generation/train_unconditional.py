@@ -52,22 +52,29 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     return res.expand(broadcast_shape)
 
 
-def _ensure_three_channels(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Ensure the tensor has exactly three channels (C, H, W) by repeating or truncating channels when needed.
-    """
+def _ensure_channels(tensor: torch.Tensor, desired_channels: int) -> torch.Tensor:
+    """Match the tensor's channel count by repeating or slicing as needed."""
     if tensor.ndim == 2:
         tensor = tensor.unsqueeze(0)
+
     channels = tensor.shape[0]
-    if channels == 3:
+    if channels == desired_channels:
         return tensor
-    if channels == 1:
-        return tensor.repeat(3, 1, 1)
-    if channels == 2:
-        return torch.cat([tensor, tensor[:1]], dim=0)
-    if channels > 3:
-        return tensor[:3]
-    raise ValueError(f"Unsupported number of channels: {channels}")
+
+    if channels > desired_channels:
+        return tensor[:desired_channels]
+
+    if channels == 1 and desired_channels > 1:
+        return tensor.repeat(desired_channels, 1, 1)
+
+    if channels < desired_channels:
+        repeats = (desired_channels + channels - 1) // channels
+        tiled = tensor.repeat(repeats, 1, 1)
+        return tiled[:desired_channels]
+
+    raise ValueError(
+        f"Unsupported channel conversion: current={channels}, desired={desired_channels}"
+    )
 
 
 def parse_args():
@@ -140,6 +147,12 @@ def parse_args():
         default=False,
         action="store_true",
         help="whether to randomly flip images horizontally",
+    )
+    parser.add_argument(
+        "--image_channels",
+        type=int,
+        default=3,
+        help="Number of channels expected in the training images and UNet.",
     )
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
@@ -380,8 +393,8 @@ def main(args):
     if args.model_config_name_or_path is None:
         model = UNet2DModel(
             sample_size=args.resolution,
-            in_channels=3,
-            out_channels=3,
+            in_channels=args.image_channels,
+            out_channels=args.image_channels,
             layers_per_block=2,
             block_out_channels=(128, 128, 256, 256, 512, 512),
             down_block_types=(
@@ -403,6 +416,9 @@ def main(args):
         )
     else:
         config = UNet2DModel.load_config(args.model_config_name_or_path)
+        if config.get("in_channels") != args.image_channels or config.get("out_channels") != args.image_channels:
+            config["in_channels"] = args.image_channels
+            config["out_channels"] = args.image_channels
         model = UNet2DModel.from_config(config)
 
     # Create EMA for the model.
@@ -482,33 +498,45 @@ def main(args):
         transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
     ]
 
+    norm = transforms.Normalize([0.5] * args.image_channels, [0.5] * args.image_channels)
+
     augmentations = transforms.Compose(
         spatial_augmentations
         + [
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
+            transforms.Lambda(lambda tensor: _ensure_channels(tensor, args.image_channels)),
+            norm,
         ]
     )
 
     precision_augmentations = transforms.Compose(
         [
             transforms.PILToTensor(),
-            transforms.Lambda(_ensure_three_channels),
+            transforms.Lambda(lambda tensor: _ensure_channels(tensor, args.image_channels)),
             transforms.ConvertImageDtype(torch.float32),
         ]
         + spatial_augmentations
-        + [transforms.Normalize([0.5], [0.5])]
+        + [norm]
     )
 
     def transform_images(examples):
         processed = []
         for image in examples["image"]:
+            if not args.preserve_input_precision and args.image_channels == 1:
+                raise ValueError(
+                    "Single-channel training images require --preserve_input_precision to maintain 16-bit data."
+                )
+
             if not args.preserve_input_precision:
-                processed.append(augmentations(image.convert("RGB")))
+                if args.image_channels == 3 and image.mode != "RGB":
+                    image = image.convert("RGB")
+                processed.append(augmentations(image))
             else:
                 precise_image = image
-                if precise_image.mode == "P":
+                if args.image_channels == 3 and precise_image.mode not in ("RGB", "RGBA"):
                     precise_image = precise_image.convert("RGB")
+                elif args.image_channels == 1 and precise_image.mode not in ("I;16", "I", "L"):
+                    precise_image = precise_image.convert("I;16")
                 processed.append(precision_augmentations(precise_image))
         return {"input": processed}
 
