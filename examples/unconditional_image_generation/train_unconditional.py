@@ -1,4 +1,5 @@
 import argparse
+import importlib
 import inspect
 import logging
 import math
@@ -106,6 +107,7 @@ def _log_sample_images(
     epoch: int,
     global_step: int,
     logger_name: str,
+    extra_logs: dict | None = None,
 ):
     if images_processed.dtype not in {np.uint8, np.uint16}:
         raise ValueError(
@@ -166,7 +168,10 @@ def _log_sample_images(
                 wandb_images.append(wandb.Image(temp_paths[-1]))
 
             try:
-                tracker.log({"test_samples": wandb_images, "epoch": epoch}, step=global_step)
+                payload = {"test_samples": wandb_images, "epoch": epoch}
+                if extra_logs:
+                    payload.update(extra_logs)
+                tracker.log(payload, step=global_step)
             finally:
                 for path in temp_paths:
                     try:
@@ -174,10 +179,10 @@ def _log_sample_images(
                     except OSError:
                         pass
         else:
-            tracker.log(
-                {"test_samples": [wandb.Image(img) for img in images_processed], "epoch": epoch},
-                step=global_step,
-            )
+            payload = {"test_samples": [wandb.Image(img) for img in images_processed], "epoch": epoch}
+            if extra_logs:
+                payload.update(extra_logs)
+            tracker.log(payload, step=global_step)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -815,6 +820,24 @@ def main(args):
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
 
+                hook_logs = {}
+                hook_path = os.environ.get("WANDB_AUDIO_HOOK") if args.logger == "wandb" else None
+                if hook_path:
+                    try:
+                        module_name, func_name = hook_path.rsplit(":", 1)
+                        hook_module = importlib.import_module(module_name)
+                        hook_fn = getattr(hook_module, func_name)
+                        hook_result = hook_fn(
+                            images=images,
+                            epoch=epoch,
+                            global_step=global_step,
+                            args=args,
+                        )
+                        if isinstance(hook_result, dict):
+                            hook_logs = hook_result
+                    except Exception:
+                        logger.exception("W&B audio hook failed")
+
                 images_processed, tb_preview = _prepare_sample_images(images, args.image_bit_depth)
 
                 if args.logger in {"tensorboard", "wandb"}:
@@ -825,6 +848,7 @@ def main(args):
                         epoch,
                         global_step,
                         args.logger,
+                        hook_logs,
                     )
 
             if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
