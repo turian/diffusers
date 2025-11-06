@@ -137,28 +137,19 @@ def _log_sample_images(
                     )
                 if img16.ndim not in {2, 3}:
                     raise ValueError(f"Unsupported array shape for 16-bit image: {img16.shape}")
-                h, w = img16.shape[:2]
                 if img16.ndim == 3:
                     channels = img16.shape[-1]
                     if channels == 1:
-                        array_for_pil = np.ascontiguousarray(img16.squeeze(-1))
-                        pil_image = Image.fromarray(array_for_pil, mode="I;16")
+                        array_for_pil = np.ascontiguousarray(img16[..., 0])
                     elif channels in {3, 4}:
-                        mode = "RGB" if channels == 3 else "RGBA"
-                        contiguous = np.ascontiguousarray(img16)
-                        pil_image = Image.frombytes(
-                            mode,
-                            (w, h),
-                            # Pillow expects big-endian for RGB(A); use ";16B" and byteswap() to match.
-                            contiguous.byteswap().tobytes(),
-                            "raw",
-                            f"{mode};16B",
-                        )
+                        # Average RGB(A) to grayscale before saving.
+                        array_for_pil = np.round(img16[..., :3].mean(axis=-1)).astype(np.uint16)
                     else:
                         raise ValueError(f"Unsupported channel count for 16-bit image: {channels}")
                 else:
-                    array_for_pil = np.ascontiguousarray(img16)
-                    pil_image = Image.fromarray(array_for_pil, mode="I;16")
+                    array_for_pil = img16
+                array_for_pil = np.ascontiguousarray(array_for_pil)
+                pil_image = Image.fromarray(array_for_pil, mode="I;16")
 
                 tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
                 temp_paths.append(tmp.name)
