@@ -109,7 +109,7 @@ def _log_sample_images(
     logger_name: str,
     extra_logs: dict | None = None,
 ):
-    if images_processed.dtype not in {np.uint8, np.uint16}:
+    if images_processed.dtype.type not in {np.uint8, np.uint16}:
         raise ValueError(
             f"Unsupported dtype for logged images: {images_processed.dtype}; expected uint8 or uint16."
         )
