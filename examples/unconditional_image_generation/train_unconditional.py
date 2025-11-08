@@ -1,14 +1,17 @@
 import argparse
+import importlib
 import inspect
 import logging
 import math
 import os
 import shutil
+import tempfile
 from datetime import timedelta
 from pathlib import Path
 
 import accelerate
 import datasets
+import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator, InitProcessGroupKwargs
@@ -69,6 +72,108 @@ def _ensure_three_channels(tensor: torch.Tensor) -> torch.Tensor:
         return tensor[:3]
     raise ValueError(f"Unsupported number of channels: {channels}")
 
+
+def _prepare_sample_images(images: np.ndarray, bit_depth: int):
+    """Scale NHWC float images in [0, 1] to uint8/uint16 arrays and build a TensorBoard-safe preview.
+
+    Expects float inputs with shape (N, H, W, C) and returns the scaled array plus an 8-bit preview.
+    """
+    if bit_depth == 8:
+        max_pixel_value = 255
+        out_dtype = np.uint8
+    elif bit_depth == 16:
+        max_pixel_value = 65535
+        out_dtype = np.uint16
+    else:
+        raise ValueError(f"Unsupported image_bit_depth: {bit_depth}")
+
+    images_processed = (
+        np.clip(np.round(images * max_pixel_value), 0, max_pixel_value).astype(out_dtype)
+    )
+
+    if bit_depth == 16:
+        # TensorBoard accepts float [0,1] or uint8 visuals, so keep a separate preview for the UI.
+        tb_preview = np.clip(np.round(images * 255), 0, 255).astype(np.uint8)
+    else:
+        tb_preview = images_processed
+
+    return images_processed, tb_preview
+
+
+def _log_sample_images(
+    accelerator: Accelerator,
+    images_processed: np.ndarray,
+    tb_preview: np.ndarray,
+    epoch: int,
+    global_step: int,
+    logger_name: str,
+    extra_logs: dict | None = None,
+):
+    if images_processed.dtype.type not in {np.uint8, np.uint16}:
+        raise ValueError(
+            f"Unsupported dtype for logged images: {images_processed.dtype}; expected uint8 or uint16."
+        )
+
+    if logger_name == "tensorboard":
+        if is_accelerate_version(">=", "0.17.0.dev0"):
+            tracker = accelerator.get_tracker("tensorboard", unwrap=True)
+        else:
+            tracker = accelerator.get_tracker("tensorboard")
+        tracker.add_images("test_samples", tb_preview.transpose(0, 3, 1, 2), global_step)
+    elif logger_name == "wandb":
+        import wandb
+
+        tracker = accelerator.get_tracker("wandb")
+        if images_processed.dtype == np.uint16:
+            # Pillow required to encode true 16-bit PNGs for W&B; fall back to 8-bit previews if unavailable.
+            from PIL import Image
+
+            wandb_images = []
+            temp_paths = []
+            for img16 in images_processed:
+                if img16.dtype != np.uint16:
+                    raise ValueError(
+                        f"Expected uint16 image for 16-bit logging, received {img16.dtype}."
+                    )
+                if img16.ndim not in {2, 3}:
+                    raise ValueError(f"Unsupported array shape for 16-bit image: {img16.shape}")
+                if img16.ndim == 3:
+                    channels = img16.shape[-1]
+                    if channels == 1:
+                        array_for_pil = np.ascontiguousarray(img16[..., 0])
+                    elif channels in {3, 4}:
+                        # Average RGB(A) to grayscale before saving.
+                        array_for_pil = np.round(img16[..., :3].mean(axis=-1)).astype(np.uint16)
+                    else:
+                        raise ValueError(f"Unsupported channel count for 16-bit image: {channels}")
+                else:
+                    array_for_pil = img16
+                array_for_pil = np.ascontiguousarray(array_for_pil)
+                pil_image = Image.fromarray(array_for_pil, mode="I;16")
+
+                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                temp_paths.append(tmp.name)
+                tmp.close()
+                # wandb.Image does not accept BytesIO; a file path preserves 16-bit PNG bytes on upload.
+                pil_image.save(temp_paths[-1], format="PNG")
+                wandb_images.append(wandb.Image(temp_paths[-1]))
+
+            try:
+                payload = {"test_samples": wandb_images, "epoch": epoch}
+                if extra_logs:
+                    payload.update(extra_logs)
+                tracker.log(payload, step=global_step)
+            finally:
+                for path in temp_paths:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+        else:
+            payload = {"test_samples": [wandb.Image(img) for img in images_processed], "epoch": epoch}
+            if extra_logs:
+                payload.update(extra_logs)
+            tracker.log(payload, step=global_step)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -146,6 +251,13 @@ def parse_args():
     )
     parser.add_argument(
         "--eval_batch_size", type=int, default=16, help="The number of images to generate for evaluation."
+    )
+    parser.add_argument(
+        "--image_bit_depth",
+        type=int,
+        choices=[8, 16],
+        default=8,
+        help="Bit depth for generated sample images during evaluation/logging. Default: 8.",
     )
     parser.add_argument(
         "--dataloader_num_workers",
@@ -699,20 +811,35 @@ def main(args):
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
 
-                # denormalize the images and save to tensorboard
-                images_processed = (images * 255).round().astype("uint8")
+                hook_logs = {}
+                hook_path = os.environ.get("WANDB_AUDIO_HOOK") if args.logger == "wandb" else None
+                if hook_path:
+                    try:
+                        module_name, func_name = hook_path.rsplit(":", 1)
+                        hook_module = importlib.import_module(module_name)
+                        hook_fn = getattr(hook_module, func_name)
+                        hook_result = hook_fn(
+                            images=images,
+                            epoch=epoch,
+                            global_step=global_step,
+                            args=args,
+                        )
+                        if isinstance(hook_result, dict):
+                            hook_logs = hook_result
+                    except Exception:
+                        logger.exception("W&B audio hook failed")
 
-                if args.logger == "tensorboard":
-                    if is_accelerate_version(">=", "0.17.0.dev0"):
-                        tracker = accelerator.get_tracker("tensorboard", unwrap=True)
-                    else:
-                        tracker = accelerator.get_tracker("tensorboard")
-                    tracker.add_images("test_samples", images_processed.transpose(0, 3, 1, 2), epoch)
-                elif args.logger == "wandb":
-                    # Upcoming `log_images` helper coming in https://github.com/huggingface/accelerate/pull/962/files
-                    accelerator.get_tracker("wandb").log(
-                        {"test_samples": [wandb.Image(img) for img in images_processed], "epoch": epoch},
-                        step=global_step,
+                images_processed, tb_preview = _prepare_sample_images(images, args.image_bit_depth)
+
+                if args.logger in {"tensorboard", "wandb"}:
+                    _log_sample_images(
+                        accelerator,
+                        images_processed,
+                        tb_preview,
+                        epoch,
+                        global_step,
+                        args.logger,
+                        hook_logs,
                     )
 
             if epoch % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:

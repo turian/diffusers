@@ -45,6 +45,7 @@ accelerate launch train_unconditional.py \
   --mixed_precision=no \
   --push_to_hub
 ```
+Append `--image_bit_depth 16` if you want evaluation samples logged as 16-bit PNGs (default is 8-bit). The script writes true 16-bit PNGs, TensorBoard still shows 8-bit previews, and W&B stores the uploaded 16-bit files even though previews are typically 8-bit and may vary by SDK version—download from the Files/Artifacts tab if you need full precision.
 An example trained model: https://huggingface.co/anton-l/ddpm-ema-flowers-64
 
 A full training run takes 2 hours on 4xV100 GPUs.
